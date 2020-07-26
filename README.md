@@ -1,1 +1,0 @@
-gwhd_efficentdet

@@ -14,7 +14,7 @@ import datetime
 import glob
 
 
-marking = pd.read_csv(r'..\input\global-wheat-detection\train.csv')
+marking = pd.read_csv(r'../input/global-wheat-detection/train.csv')
 
 bboxs = np.stack(marking['bbox'].apply(lambda x: np.fromstring(x[1:-1], sep=',')))
 for i, column in enumerate(['x', 'y', 'w', 'h']):
@@ -31,20 +31,31 @@ df_folds.loc[:, 'stratify_group'] = np.char.add(
     df_folds['source'].values.astype(str),
     df_folds['bbox_count'].apply(lambda x: f'_{x // 15}').values.astype(str)
 )
+
+# print("group: ",np.unique(df_folds.stratify_group))
+# stratify_count = df_folds[['stratify_group']].groupby('stratify_group').count()
+# print("stratify distribution：",stratify_count)
+# # 这么做的目的来源于两个方面。
+# # 1. 需要保证划分的多折训练集中数据来源占比一致。
+# # 2. 需要保证划分的多折训练集中 bbox 分布大致一致。
+
 df_folds.loc[:, 'fold'] = 0
 
 for fold_number, (train_index, val_index) in enumerate(skf.split(X=df_folds.index, y=df_folds['stratify_group'])):
     df_folds.loc[df_folds.iloc[val_index].index, 'fold'] = fold_number
+
 
 def get_train_transforms():
     return A.Compose(
         [
             A.RandomSizedCrop(min_max_height=(800, 800), height=1024, width=1024, p=0.5),
             A.OneOf([
-                A.HueSaturationValue(hue_shift_limit=0.1, sat_shift_limit= 0.3,
-                                     val_shift_limit=0.3, p=0.9),
-                A.RandomBrightnessContrast(brightness_limit=0.4,
-                                           contrast_limit=0.3, p=0.9),
+                # A.HueSaturationValue(hue_shift_limit=0.1, sat_shift_limit= 0.3,
+                #                      val_shift_limit=0.3, p=0.9),
+                A.HueSaturationValue(p=0.9),
+                A.RandomBrightnessContrast(p=0.9),
+                # A.RandomBrightnessContrast(brightness_limit=0.4,
+                #                            contrast_limit=0.3, p=0.9),
             ],p=0.9),
             A.ToGray(p=0.01),
             A.HorizontalFlip(p=0.5),
@@ -93,9 +104,11 @@ class DatasetRetriever(Dataset):
 
     def __getitem__(self, index: int):
         image_id = self.image_ids[index]
-
-        if self.test or random.random() > 0.5:
+        oppt = random.random()
+        if self.test or oppt > 0.75:
             image, boxes = self.load_image_and_boxes(index)
+        elif oppt > 0.25:
+            image, boxes = self.load_cutmix_image_and_boxes(index)
         else:
             image, boxes = self.load_mixup_image_and_boxes(index)
 
@@ -251,7 +264,7 @@ class Fitter:
     def __init__(self, model, device, config):
         self.config = config
         self.epoch = 0
-
+        self.bs = config.batch_size
         self.base_dir = f'./{config.folder}'
         if not os.path.exists(self.base_dir):
             os.makedirs(self.base_dir)
@@ -270,6 +283,7 @@ class Fitter:
         ]
 
         self.optimizer = torch.optim.RMSprop(self.model.parameters(), lr=config.lr)
+        #self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
         self.scheduler = config.SchedulerClass(self.optimizer, **config.scheduler_params)
         self.log(f'Fitter prepared. Device is {self.device}')
 
@@ -281,26 +295,28 @@ class Fitter:
                 self.log(f'\n{timestamp}\nLR: {lr}')
 
             t = time.time()
-            summary_loss = self.train_one_epoch(train_loader)
+            train_summary_loss = self.train_one_epoch(train_loader)
 
             self.log(
-                f'[RESULT]: Train. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
+                f'[RESULT]: Train. Epoch: {self.epoch}, summary_loss: {train_summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
             self.save(f'{self.base_dir}/last-checkpoint.bin')
 
             t = time.time()
-            summary_loss = self.validation(validation_loader)
+            val_summary_loss = self.validation(validation_loader)
 
             self.log(
-                f'[RESULT]: Val. Epoch: {self.epoch}, summary_loss: {summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
-            if summary_loss.avg < self.best_summary_loss:
-                self.best_summary_loss = summary_loss.avg
+                f'[RESULT]: Val. Epoch: {self.epoch}, summary_loss: {val_summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
+
+            #print(f'[RESULT]: Epoch: {self.epoch}, train_summary_loss: {train_summary_loss.avg:.5f},val_summary_loss: {train_summary_loss.avg:.5f}, time: {(time.time() - t):.5f}')
+            if val_summary_loss.avg < self.best_summary_loss:
+                self.best_summary_loss = val_summary_loss.avg
                 self.model.eval()
                 self.save(f'{self.base_dir}/best-checkpoint-{str(self.epoch).zfill(3)}epoch.bin')
                 # for path in sorted(glob(f'{self.base_dir}/best-checkpoint-*epoch.bin'))[:-3]:
                 #     os.remove(path)
 
             if self.config.validation_scheduler:
-                self.scheduler.step(metrics=summary_loss.avg)
+                self.scheduler.step(metrics=val_summary_loss.avg)
 
             self.epoch += 1
 
@@ -332,6 +348,8 @@ class Fitter:
         self.model.train()
         summary_loss = AverageMeter()
         t = time.time()
+        accumulate = self.config.accumulate_steps  # accumulate loss before optimizing
+        step = 0
         for step, (images, targets, image_ids) in enumerate(train_loader):
             if self.config.verbose:
                 if step % self.config.verbose_step == 0:
@@ -347,18 +365,21 @@ class Fitter:
             boxes = [target['boxes'].to(self.device).float() for target in targets]
             labels = [target['labels'].to(self.device).float() for target in targets]
 
-            self.optimizer.zero_grad()
-
             loss, _, _ = self.model(images, boxes, labels)
-
+            loss = loss
             loss.backward()
+            summary_loss.update((loss).detach().item(), batch_size)
 
-            summary_loss.update(loss.detach().item(), batch_size)
-
-            self.optimizer.step()
+            if (step+1) % accumulate == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
             if self.config.step_scheduler:
                 self.scheduler.step()
+
+        if (step+1) % accumulate !=0 :
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
         return summary_loss
 
@@ -389,11 +410,12 @@ class Fitter:
 
 class TrainGlobalConfig:
     num_workers = 2
+    accumulate_steps = 32
     batch_size = 2
     n_epochs = 40  # n_epochs = 40
-    lr = 0.0004
+    lr = 0.0004 # 0.0004
 
-    folder = 'effdet5-cutmix-augmix1'
+    folder = 'effdet5-from-coco'
 
     # -------------------
     verbose = True
@@ -417,8 +439,8 @@ class TrainGlobalConfig:
     SchedulerClass = torch.optim.lr_scheduler.ReduceLROnPlateau
     scheduler_params = dict(
         mode='min',
-        factor=0.5,
-        patience=1,
+        factor=0.5, # 0.8
+        patience=1, # 2
         verbose=False,
         threshold=0.0001,
         threshold_mode='abs',
@@ -432,7 +454,10 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 def run_training():
-    device = torch.device('cuda:0')
+    # device = torch.device('cuda:0')
+    # net.to(device)
+
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     net.to(device)
 
     train_loader = torch.utils.data.DataLoader(
@@ -461,22 +486,33 @@ from effdet import get_efficientdet_config, EfficientDet, DetBenchTrain
 from effdet.efficientdet import HeadNet
 
 def get_net():
-    config = get_efficientdet_config('tf_efficientdet_d5')
 
-    net = EfficientDet(config, pretrained_backbone=False)
+    ## GWD restart
+    # config = get_efficientdet_config('tf_efficientdet_d5')
+    # print("det config: ",config)
     # config.num_classes = 1
     # config.image_size = 512
-    # net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
-    # checkpoint = torch.load(r'D:\Workspace\efficientdet-pytorch-master\effdet5-cutmix-augmix\last-checkpoint.bin')
+    # net = EfficientDet(config, pretrained_backbone=False)
+    # # net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
+    # checkpoint = torch.load(r'../input/eff_checkpoint/last-checkpoint.bin')
     # net.load_state_dict(checkpoint['model_state_dict'])
 
-    #checkpoint = torch.load(r'D:\global-wheat-detection\eff\effdet5-cutmix-augmix1\last-checkpoint.bin')
-    #net.load_state_dict(checkpoint)
+    ##From coco baseline
+    config = get_efficientdet_config('tf_efficientdet_d5')
+    print("det config: ",config)
+    net = EfficientDet(config, pretrained_backbone=False)
+    checkpoint = torch.load(r'../input/eff_checkpoint/tf_efficientdet_d5-ef44aea8.pth')
+    net.load_state_dict(checkpoint)
     config.num_classes = 1
     config.image_size = 512
+
     net.class_net = HeadNet(config, num_outputs=config.num_classes, norm_kwargs=dict(eps=.001, momentum=.01))
     return DetBenchTrain(net, config)
 if __name__ == '__main__':
+
+    # Select GPU device if there are multiple GPUs
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
     net = get_net()
 
     run_training()

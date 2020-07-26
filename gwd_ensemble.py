@@ -96,8 +96,8 @@ def make_predictions(images, score_threshold=0.22):
             scores = det[0].detach().cpu().numpy()[:, 4]
             indexes = np.where(scores > score_threshold)[0]
             boxes = boxes[indexes]
-            boxes[:, 2] = boxes[:, 2] + boxes[:, 0]
-            boxes[:, 3] = boxes[:, 3] + boxes[:, 1]
+            boxes[:, 2] = boxes[:, 2] + boxes[:, 0] #xw->xx
+            boxes[:, 3] = boxes[:, 3] + boxes[:, 1] #yh->yy
             boxes = boxes[indexes]
             scores = scores[indexes]
             if len(boxes_All) == 0:

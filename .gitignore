@@ -135,3 +135,17 @@ dmypy.json
 *.tar
 *.pth
 *.gz
+
+effdet5-adamw_512_accum_grad/
+
+effdet5-cutmix-augmix/
+
+effdet5-cutmix-augmix1/
+
+effdet5-from-coco/
+
+effdet5-from-coco_y5optim_2/
+
+plabel_model/
+
+effdet5-from-coco_y5optim/

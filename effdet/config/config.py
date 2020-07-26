@@ -35,6 +35,7 @@ def default_detection_configs():
     h.num_levels = h.max_level - h.min_level + 1
     h.num_scales = 3
     h.aspect_ratios = [(1.0, 1.0), (1.4, 0.7), (0.7, 1.4)]
+    #h.aspect_ratios = [(1.0, 1.0), (1.4, 0.7), (0.8, 1.2)]
     h.anchor_scale = 4.0
     h.pad_type = 'same'
 
